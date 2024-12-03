@@ -18,10 +18,12 @@ defmodule Anoma.Node.Intents.Solver do
   alias Node.Intents.IntentPool
   alias Node.Registry
   alias Anoma.RM.Intent
+  alias EventBroker.Broker
   alias EventBroker.Event
   alias EventBroker.Filters
 
   require Logger
+  require Node.Event
 
   ############################################################
   #                    State                                 #
@@ -114,8 +116,7 @@ defmodule Anoma.Node.Intents.Solver do
 
   @impl true
   def handle_info(event = %Event{}, state) do
-    state = handle_event(event, state)
-    {:noreply, state}
+    handle_event(event, state)
   end
 
   ############################################################
@@ -126,7 +127,8 @@ defmodule Anoma.Node.Intents.Solver do
   # I handle a new event coming from the event broker.
   # I am only interested in new intents.
   # """
-  @spec handle_event(Event.t(), t()) :: t()
+  @spec handle_event(Event.t(), t()) ::
+          {:noreply, t()} | {:noreply, t(), {:continue, any()}}
   defp handle_event(event = %Event{}, state) do
     case event do
       %Event{
@@ -137,7 +139,7 @@ defmodule Anoma.Node.Intents.Solver do
 
       _ ->
         Logger.warning("unexpected event in solver: #{inspect(event)}")
-        state
+        {:noreply, state}
     end
   end
 
@@ -161,21 +163,21 @@ defmodule Anoma.Node.Intents.Solver do
   # I handle adding a new intent.
   # I add the intent to the list of unsolved intents, and then attempt to solve.
   # """
-  @spec handle_new_intent(Intent.t(), t()) :: t()
+  @spec handle_new_intent(Intent.t(), t()) ::
+          {:noreply, t()} | {:noreply, t(), {:continue, any()}}
   defp handle_new_intent(intent, state) do
     Logger.debug("solver received new intent: #{inspect(intent)}")
     unsolved? = intent in state.unsolved
     solved? = intent in state.solved
 
     if not unsolved? and not solved? do
-      new_state = %{state | unsolved: MapSet.put(state.unsolved, intent)}
-      do_solve(new_state)
+      do_solve(state, intent)
     else
       Logger.debug(
         "ignoring intent; unsolved: #{unsolved?}, solved: #{solved?}"
       )
 
-      state
+      {:noreply, state}
     end
   end
 
@@ -187,20 +189,59 @@ defmodule Anoma.Node.Intents.Solver do
   # I try and solve the intents currently in my state.
   # If I can solve some of them, I add them to the solved pool.
   # """
-  @spec do_solve(t()) :: t()
-  def do_solve(state) do
-    {solved, unsolved} =
-      case solve(state.unsolved) do
-        nil ->
-          {state.solved, state.unsolved}
+  @spec do_solve(t(), Intent.t()) :: {:noreply, t(), {:continue, any()}}
+  def do_solve(state, new_intent) do
+    updated_unsolved = MapSet.put(state.unsolved, new_intent)
 
-        new_solves ->
-          new_solves = MapSet.union(state.solved, new_solves)
-          new_unsolveds = MapSet.difference(state.unsolved, new_solves)
-          {new_solves, new_unsolveds}
+    {new_state, newly_solved} =
+      case solve(updated_unsolved) do
+        nil ->
+          new_state = %{state | unsolved: updated_unsolved}
+          newly_solved = MapSet.new()
+          {new_state, newly_solved}
+
+        solved_now ->
+          new_solved = MapSet.union(state.solved, solved_now)
+          new_unsolved = MapSet.difference(updated_unsolved, solved_now)
+          new_state = %{state | solved: new_solved, unsolved: new_unsolved}
+
+          # Determine newly solved intents
+          newly_solved = MapSet.difference(new_solved, state.solved)
+          {new_state, newly_solved}
       end
 
-    %{state | solved: solved, unsolved: unsolved}
+    {
+      :noreply,
+      new_state,
+      {:continue, {:emit_events, newly_solved, new_intent}}
+    }
+  end
+
+  @impl true
+  def handle_continue({:emit_events, newly_solved, new_intent}, state) do
+    # Emit events for all newly solved intents
+    Enum.each(newly_solved, &emit_intent_solved(state.node_id, &1))
+
+    # If the new intent is not among the newly solved, emit unsolved intent added
+    unless MapSet.member?(newly_solved, new_intent) do
+      emit_unsolved_intent_added(state.node_id, new_intent)
+    end
+
+    {:noreply, state}
+  end
+
+  defp emit_intent_solved(node_id, intent) do
+    EventBroker.event(
+      Node.Event.new_with_body(node_id, {:intent_solved, intent}),
+      Broker
+    )
+  end
+
+  defp emit_unsolved_intent_added(node_id, intent) do
+    EventBroker.event(
+      Node.Event.new_with_body(node_id, {:unsolved_intent_added, intent}),
+      Broker
+    )
   end
 
   # @doc """

@@ -6,10 +6,13 @@ defmodule Anoma.Node.Examples.ESolver do
   require ExUnit.Assertions
   import ExUnit.Assertions
 
+  alias Anoma.Node.Event
   alias Anoma.Node.Intents.IntentPool
   alias Anoma.Node.Intents.Solver
   alias Anoma.RM.DumbIntent
   alias Anoma.Node.Examples.ENode
+
+  use EventBroker.WithSubscription
 
   ############################################################
   #                           Scenarios                      #
@@ -70,36 +73,124 @@ defmodule Anoma.Node.Examples.ESolver do
     assert [] == Solver.get_solved(enode.node_id)
     assert [] == Solver.get_unsolved(enode.node_id)
 
-    # add an intent to the pool
-    # note: this is asynchronous, so block this process for a bit
-    intent_1 = %DumbIntent{value: -1}
-    IntentPool.new_intent(enode.node_id, intent_1)
-    Process.sleep(100)
+    with_subscription [[Event.node_filter(enode.node_id)]] do
+      # add an intent to the pool
+      # note: this is asynchronous, so block this process for a bit
+      intent_1 = %DumbIntent{value: -1}
+      IntentPool.new_intent(enode.node_id, intent_1)
 
-    # the solver does not have solved transactions.
-    assert Solver.get_solved(enode.node_id) == []
-    assert Solver.get_unsolved(enode.node_id) == [intent_1]
+      :ok = wait_for_unsolved_intent_added(enode.node_id, intent_1)
 
-    # --------------------------------------------------------------------------
-    # add a second intent to make it solvable
+      # the solver does not have solved transactions.
+      assert Solver.get_solved(enode.node_id) == []
+      assert Solver.get_unsolved(enode.node_id) == [intent_1]
 
-    intent_2 = %DumbIntent{value: 1}
-    IntentPool.new_intent(enode.node_id, intent_2)
-    Process.sleep(100)
+      # --------------------------------------------------------------------------
+      # add a second intent to make it solvable
 
-    # the solver does not have solved transactions.
-    assert Solver.get_solved(enode.node_id) == [intent_1, intent_2]
-    assert Solver.get_unsolved(enode.node_id) == []
+      intent_2 = %DumbIntent{value: 1}
+      IntentPool.new_intent(enode.node_id, intent_2)
 
-    # --------------------------------------------------------------------------
-    # add a third intent to make it unsolvable
+      :ok = wait_for_intent_solved(enode.node_id, intent_2)
 
-    intent_3 = %DumbIntent{value: 1000}
-    IntentPool.new_intent(enode.node_id, intent_3)
-    Process.sleep(100)
+      # the solver does not have solved transactions.
+      assert Solver.get_solved(enode.node_id) == [intent_1, intent_2]
+      assert Solver.get_unsolved(enode.node_id) == []
 
-    # the solver does not have solved transactions.
-    assert Solver.get_solved(enode.node_id) == [intent_1, intent_2]
-    assert Solver.get_unsolved(enode.node_id) == [intent_3]
+      # --------------------------------------------------------------------------
+      # add a third intent to make it unsolvable
+
+      intent_3 = %DumbIntent{value: 1000}
+      IntentPool.new_intent(enode.node_id, intent_3)
+
+      :ok = wait_for_unsolved_intent_added(enode.node_id, intent_3)
+
+      # the solver does not have solved transactions.
+      assert Solver.get_solved(enode.node_id) == [intent_1, intent_2]
+      assert Solver.get_unsolved(enode.node_id) == [intent_3]
+    end
+  end
+
+  @doc """
+  I test the behavior of separate solver instances across two different nodes.
+  Each node manages its own intents and solves them independently.
+  """
+  @spec solvers_isolated() :: boolean()
+  def solvers_isolated() do
+    enode1 = ENode.start_node()
+    enode2 = ENode.start_node()
+
+    with_subscription [
+      [Event.node_filter(enode1.node_id)],
+      [Event.node_filter(enode2.node_id)]
+    ] do
+      intent_1 = %DumbIntent{value: -111}
+      IntentPool.new_intent(enode1.node_id, intent_1)
+
+      :ok = wait_for_unsolved_intent_added(enode1.node_id, intent_1)
+
+      assert Solver.get_solved(enode1.node_id) == []
+      assert Solver.get_unsolved(enode1.node_id) == [intent_1]
+      assert Solver.get_solved(enode2.node_id) == []
+      assert Solver.get_unsolved(enode2.node_id) == []
+
+      intent_2 = %DumbIntent{value: -222}
+      IntentPool.new_intent(enode2.node_id, intent_2)
+
+      :ok = wait_for_unsolved_intent_added(enode2.node_id, intent_2)
+
+      assert Solver.get_solved(enode1.node_id) == []
+      assert Solver.get_unsolved(enode1.node_id) == [intent_1]
+      assert Solver.get_solved(enode2.node_id) == []
+      assert Solver.get_unsolved(enode2.node_id) == [intent_2]
+
+      intent_3 = %DumbIntent{value: 111}
+      IntentPool.new_intent(enode1.node_id, intent_3)
+
+      :ok = wait_for_intent_solved(enode1.node_id, intent_1)
+
+      assert Solver.get_solved(enode1.node_id) == [intent_1, intent_3]
+      assert Solver.get_unsolved(enode1.node_id) == []
+      assert Solver.get_solved(enode2.node_id) == []
+      assert Solver.get_unsolved(enode2.node_id) == [intent_2]
+
+      intent_4 = %DumbIntent{value: 222}
+      IntentPool.new_intent(enode2.node_id, intent_4)
+
+      :ok = wait_for_intent_solved(enode2.node_id, intent_2)
+
+      assert Solver.get_solved(enode1.node_id) == [intent_1, intent_3]
+      assert Solver.get_unsolved(enode1.node_id) == []
+      assert Solver.get_solved(enode2.node_id) == [intent_2, intent_4]
+      assert Solver.get_unsolved(enode2.node_id) == []
+    end
+  end
+
+  defp wait_for_intent_solved(node_id, intent) do
+    receive do
+      %EventBroker.Event{
+        body: %Anoma.Node.Event{
+          body: {:intent_solved, ^intent},
+          node_id: ^node_id
+        }
+      } ->
+        :ok
+    after
+      1000 -> {:error, :timeout}
+    end
+  end
+
+  defp wait_for_unsolved_intent_added(node_id, intent) do
+    receive do
+      %EventBroker.Event{
+        body: %Anoma.Node.Event{
+          body: {:unsolved_intent_added, ^intent},
+          node_id: ^node_id
+        }
+      } ->
+        :ok
+    after
+      1000 -> {:error, :timeout}
+    end
   end
 end
